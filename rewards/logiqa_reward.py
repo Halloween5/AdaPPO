@@ -1,16 +1,14 @@
 """
-GSM8K RLVR AgentExecutor — Verifiable Math Reward.
+LogiQA RLVR AgentExecutor — 4-choice Logical Reasoning Reward.
 
-Replaces the reward model with deterministic answer checking.
-Extracts `#### <number>` from the model's generated response,
-compares with the ground-truth answer, and returns:
-  reward = 1.0  if correct
-  reward = 0.0  otherwise
+Model receives a context + question + 4 options, must output the correct letter.
+  answer = a/b/c/d, reward = 1.0 if correct, 0.0 otherwise.
 
 Usage:
-  --train.agent_func_path=/path/to/gsm8k_reward.py
+  --train.agent_func_path=/path/to/logiqa_reward.py
 """
 
+import os
 import re
 from copy import deepcopy
 from typing import Optional
@@ -19,79 +17,52 @@ from openrlhf.utils.agent import AgentExecutorBase
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Answer extraction utilities
+# Answer extraction
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _parse_num(s: str) -> Optional[float]:
-    """Parse a number string, handling commas and decimals. Returns None on failure."""
-    s = s.replace(",", "").strip()
-    if not s:
-        return None
-    try:
-        return float(s)
-    except ValueError:
-        return None
-
-
-def extract_final_answer(text: str) -> Optional[float]:
-    """
-    Extract the final answer from a GSM8K-style response.
-    Priority: `#### <number>` > `The answer is <number>` > last bare number.
-    Returns None if no answer could be extracted.
-    """
+def extract_answer(text: str) -> Optional[str]:
     if not text:
         return None
 
-    # Method 1: standard GSM8K `#### <number>`
-    m = re.findall(r"####\s*(-?[\d,]+\.?\d*)", text)
-    if m:
-        return _parse_num(m[-1])
+    text_lower = text.lower().strip()
+    lines = [l.strip() for l in text_lower.split("\n") if l.strip()]
 
-    # Method 2: `The answer is <number>`
-    m = re.findall(
-        r"(?:the\s+)?(?:final\s+)?answer\s+(?:is\s*)?:?\s*(-?[\d,]+\.?\d*)",
-        text, re.IGNORECASE,
-    )
-    if m:
-        return _parse_num(m[-1])
-
-    # Method 3: last short line with a bare number
-    lines = [l.strip() for l in text.strip().split("\n") if l.strip()]
+    # ── Only method: explicit answer line ──
+    #   "answer is (C)", "option C is correct", "correct answer is C"
     for line in reversed(lines):
-        if len(line.split()) <= 3:
-            m = re.match(r"^(-?[\d,]+\.?\d*)$", line)
-            if m:
-                return _parse_num(m.group(1))
+        patterns = [
+            r"(?:答案|answer|correct|choice|选|option|therefore|所以|thus)[：:\s]*([a-d])",
+            r"answer\s+is\s+\(?([a-d])\)?",
+            r"option\s+\(?([a-d])\)?",
+            r"\(([a-d])\)",
+            r"is\s+correct\s*\(?([a-d])\)?",
+        ]
+        for p in patterns:
+            m = re.search(p, line)
+            if m and m.group(1) in ("a", "b", "c", "d"):
+                return m.group(1)
 
     return None
 
 
-def _extract_ground_truth(label) -> Optional[float]:
-    """Parse ground-truth from various formats: '#### 42', '42', or bare number."""
+def _parse_label(label) -> Optional[str]:
+    """Parse ground-truth label: a/b/c/d."""
     if label is None:
         return None
-    if isinstance(label, (int, float)):
-        return float(label)
-    gt_text = str(label).strip()
-    if not gt_text:
-        return None
-    m = re.search(r"####\s*(-?[\d,]+\.?\d*)", gt_text)
-    if m:
-        return _parse_num(m.group(1))
-    try:
-        return float(gt_text.replace(",", "").strip())
-    except ValueError:
-        return None
+    s = str(label).strip().lower()
+    if s in ("a", "b", "c", "d"):
+        return s
+    return None
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# AgentExecutor — OpenRLHF single-turn agent with math-verifiable reward
+# AgentExecutor
 # ══════════════════════════════════════════════════════════════════════════════
 
 class AgentExecutor(AgentExecutorBase):
     """
-    Single-turn agent that generates a math solution and scores it
-    against the ground-truth answer (RLVR — no reward model needed).
+    Single-turn agent that answers a logic question and scores it
+    against ground-truth label (a/b/c/d).
     """
 
     async def execute(
@@ -166,9 +137,18 @@ class AgentExecutor(AgentExecutorBase):
                 )
 
         response_text = hf_tokenizer.decode(action_token_ids, skip_special_tokens=True)
-        pred = extract_final_answer(response_text)
-        gt = _extract_ground_truth(label)
-        reward = 1.0 if (pred is not None and gt is not None and abs(pred - gt) < 1e-6) else 0.0
+        pred = extract_answer(response_text)
+        gt = _parse_label(label)
+
+        if pred is not None and gt is not None and pred == gt:
+            min_len = int(os.environ.get("LOGIQA_MIN_LEN", "200"))
+            short_reward = float(os.environ.get("LOGIQA_SHORT_REWARD", "0.35"))
+            d_max = 1.0 - short_reward
+            resp_len = len(action_token_ids)
+            d = min(d_max, max(0.0, d_max * (min_len - resp_len) / 100.0))
+            reward = 1.0 - d
+        else:
+            reward = 0.0
 
         return {
             "prompt": prompt,
@@ -183,3 +163,6 @@ class AgentExecutor(AgentExecutorBase):
             "scores": reward,
             "extra_logs": {},
         }
+
+
+extract_final_answer = extract_answer
