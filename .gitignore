@@ -1,0 +1,21 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# run artefacts
+runs/
+ckpt/
+ray_tmp/
+ppo_logs/
+*.jsonl
+*.pt
+*.pth
+*.safetensors
+*.png
+*.pdf
+!scripts/*.png
+
+# data (prepare locally, see README)
+data/
